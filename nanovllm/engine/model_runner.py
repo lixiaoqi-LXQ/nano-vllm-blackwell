@@ -1,3 +1,4 @@
+# 模型运行器模块，负责模型初始化、KV缓存分配和推理执行
 import pickle
 import torch
 import torch.distributed as dist
@@ -13,8 +14,17 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+    """模型运行器，管理模型加载、KV缓存、CUDA Graph和推理执行"""
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        """
+        初始化模型运行器
+
+        Args:
+            config: 配置对象
+            rank: 当前进程rank（用于张量并行）
+            event: 进程间通信事件
+        """
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,11 +33,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 初始化NCCL进程组
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        # 初始化模型
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -38,6 +50,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # 多进程模式下的worker进程启动事件循环
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -48,6 +61,7 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        """清理资源，销毁进程组和共享内存"""
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -59,6 +73,7 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """Worker进程事件循环，接收并执行主进程的指令"""
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
@@ -66,6 +81,7 @@ class ModelRunner:
                 break
 
     def read_shm(self):
+        """从共享内存读取指令"""
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
@@ -74,6 +90,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        """向共享内存写入指令，通知worker进程"""
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
@@ -83,12 +100,20 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        """
+        调用指定方法，多进程模式下同步到所有worker
+
+        Args:
+            method_name: 方法名
+            *args: 方法参数
+        """
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
+        """模型预热，用于测量显存占用和初始化CUDA kernel"""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -98,18 +123,26 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """
+        分配KV缓存内存
+
+        根据预热后的显存使用情况，自动计算可分配的KV缓存块数
+        """
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # 计算每个块的字节数（key + value）
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # 分配KV缓存张量 [kv类型, 层数, 块数, 块大小, KV头数, 头维度]
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        # 将缓存的视图分配给各层的attention模块
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -118,19 +151,37 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        """
+        准备块表，用于从KV缓存中查找对应块
+
+        Args:
+            seqs: 序列列表
+
+        Returns:
+            块表张量
+        """
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """
+        准备prefill阶段输入
+
+        Args:
+            seqs: 序列列表
+
+        Returns:
+            tuple: (input_ids, positions)
+        """
         input_ids = []
         positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        cu_seqlens_q = [0]  # 累积序列长度（query，未缓存部分）
+        cu_seqlens_k = [0]  # 累积序列长度（key，包括缓存）
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping = []   # token到KV缓存slot的映射
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
@@ -142,16 +193,17 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+            if not seq.block_table:    # warmup阶段
                 continue
+            # 计算需要写入KV缓存的slot映射
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # 前缀缓存命中，需要准备块表
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -162,6 +214,15 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        """
+        准备decode阶段输入
+
+        Args:
+            seqs: 序列列表
+
+        Returns:
+            tuple: (input_ids, positions)
+        """
         input_ids = []
         positions = []
         slot_mapping = []
@@ -180,6 +241,15 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        """
+        准备采样温度
+
+        Args:
+            seqs: 序列列表
+
+        Returns:
+            温度张量
+        """
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
@@ -188,9 +258,22 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """
+        运行模型推理
+
+        Args:
+            input_ids: 输入token ids
+            positions: 位置信息
+            is_prefill: 是否为prefill阶段
+
+        Returns:
+            输出logits
+        """
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # Prefill阶段、强制eager模式或批次过大时使用eager执行
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # Decode阶段使用CUDA Graph加速
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -206,6 +289,16 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """
+        执行推理
+
+        Args:
+            seqs: 序列列表
+            is_prefill: 是否为prefill阶段
+
+        Returns:
+            生成的token ids列表（仅rank 0返回）
+        """
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
@@ -215,20 +308,28 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        """
+        捕获CUDA Graph用于加速decode阶段
+
+        为不同批次大小预先捕获CUDA Graph，避免重复的kernel启动开销
+        """
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # 预分配静态内存
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # 预定义要捕获的批次大小
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
+        # 从大到小捕获，确保大的graph能复用内存池
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
@@ -241,6 +342,7 @@ class ModelRunner:
             torch.cuda.synchronize()
             reset_context()
 
+        # 保存graph的静态变量引用，用于replay时更新数据
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,

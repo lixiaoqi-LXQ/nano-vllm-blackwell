@@ -1,3 +1,4 @@
+# 词嵌入和LM头模块
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -7,12 +8,20 @@ from nanovllm.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
+    """词表并行嵌入层"""
 
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
     ):
+        """
+        初始化词表并行嵌入层
+
+        Args:
+            num_embeddings: 词表大小
+            embedding_dim: 嵌入维度
+        """
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -25,6 +34,7 @@ class VocabParallelEmbedding(nn.Module):
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """权重加载器：按词表分片加载"""
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
@@ -32,17 +42,29 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        """
+        前向计算：词嵌入查询
+
+        Args:
+            x: 输入token ids
+
+        Returns:
+            嵌入向量
+        """
         if self.tp_size > 1:
+            # 计算哪些token属于当前分片
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
+            # 只保留属于当前分片的结果，其他位置置零
             y = mask.unsqueeze(1) * y
             dist.all_reduce(y)
         return y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """词表并行语言模型头（用于输出logits）"""
 
     def __init__(
         self,
@@ -54,12 +76,23 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        """
+        前向计算：输出logits
+
+        Args:
+            x: 隐藏状态
+
+        Returns:
+            输出logits（仅rank 0返回完整logits）
+        """
         context = get_context()
         if context.is_prefill:
+            # Prefill阶段：只取每个序列的最后一个token
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
+            # 收集所有rank的logits到rank 0
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
