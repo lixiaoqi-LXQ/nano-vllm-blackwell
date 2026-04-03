@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 
 def main():
     """示例：使用nano-vllm进行文本生成"""
-    path = os.path.expanduser("/data/models/Qwen3-8B")
+    path = os.path.expanduser("/data/models/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     # 初始化LLM
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)

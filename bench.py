@@ -13,13 +13,13 @@ def main():
     max_input_len = 1024  # 最大输入长度
     max_ouput_len = 1024  # 最大输出长度
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("/data/models/Qwen3-0.6B")
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     # 生成随机输入token ids
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     # 为每个序列生成随机采样参数
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
+    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_ouput_len) for _ in range(num_seqs)]
     # 取消下面的注释以使用vllm
     # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
