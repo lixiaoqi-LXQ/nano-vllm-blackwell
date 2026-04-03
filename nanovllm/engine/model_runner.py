@@ -6,10 +6,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanovllm.utils.loader import load_model, get_model_class
 
 
 class ModelRunner:
@@ -28,8 +27,22 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+
+        # Use factory function to select appropriate model class
+        model_class = get_model_class(config.model, hf_config)
+        self.model = model_class(hf_config)
         load_model(self.model, config.model)
+
+        # Print FP8 info if detected
+        if rank == 0 and self.model.has_fp8_weights:
+            from nanovllm.utils.fp8_utils import get_fp8_info, is_native_fp8_supported
+            print(f"FP8 model detected")
+            print(f"  {get_fp8_info()}")
+            if is_native_fp8_supported():
+                print(f"  Native FP8 GEMM: Supported")
+            else:
+                print(f"  Native FP8 GEMM: Not supported (using fallback)")
+
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

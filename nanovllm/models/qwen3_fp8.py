@@ -1,3 +1,9 @@
+"""Qwen3 FP8 Model - Uses independent FP8 linear layers.
+
+This model is specifically designed for FP8 quantized weights and uses
+the independent FP8 linear layers from nanovllm.layers.fp8_linear.
+"""
+
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -6,12 +12,17 @@ from transformers import Qwen3Config
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.fp8_linear import (
+    FP8QKVParallelLinear,
+    FP8MergedColumnParallelLinear,
+    FP8RowParallelLinear,
+)
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen3Attention(nn.Module):
+class Qwen3FP8Attention(nn.Module):
+    """Attention module using FP8 linear layers."""
 
     def __init__(
         self,
@@ -39,14 +50,16 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
+        # Use FP8 QKV projection
+        self.qkv_proj = FP8QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        # Use FP8 output projection
+        self.o_proj = FP8RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -87,7 +100,8 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3MLP(nn.Module):
+class Qwen3FP8MLP(nn.Module):
+    """MLP module using FP8 linear layers."""
 
     def __init__(
         self,
@@ -96,12 +110,14 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        # Use FP8 merged column parallel for gate_up_proj
+        self.gate_up_proj = FP8MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        # Use FP8 row parallel for down_proj
+        self.down_proj = FP8RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -116,14 +132,15 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen3FP8DecoderLayer(nn.Module):
+    """Decoder layer using FP8 attention and MLP."""
 
     def __init__(
         self,
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Qwen3FP8Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -134,7 +151,7 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen3FP8MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -158,7 +175,8 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class Qwen3FP8Model(nn.Module):
+    """Qwen3 model body using FP8 layers."""
 
     def __init__(
         self,
@@ -166,7 +184,9 @@ class Qwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            Qwen3FP8DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -182,7 +202,14 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3FP8ForCausalLM(nn.Module):
+    """Qwen3 model for causal LM using FP8 linear layers.
+
+    This model uses independent FP8 linear layers throughout and is designed
+    specifically for FP8 quantized weights. It always has has_fp8_weights=True.
+    """
+
+    # Mapping from individual projections to packed modules
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -196,12 +223,12 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen3FP8Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        # FP8 flag (set by load_model when FP8 scales are detected)
-        self.has_fp8_weights = False
+        # FP8 flag - always True for this model
+        self.has_fp8_weights = True
 
     def forward(
         self,
