@@ -418,7 +418,7 @@ def _fp8_linear_flashinfer(
     if bias is not None:
         output = output + bias
 
-    return output
+    return output, act_fp8, act_scale_inv
 
 
 def get_fp8_backend() -> FP8Backend:

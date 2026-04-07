@@ -30,10 +30,13 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        # has_fp8_weights and has_fp4_weights are set by the loader
         self.sampler = Sampler()
+        self.use_flashinfer = getattr(self.model, 'has_fp4_weights', False)
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        # FP4 models with FlashInfer do not support CUDA graphs (plan() requires host-side compute)
+        if not self.enforce_eager and not getattr(self.model, 'has_fp4_weights', False):
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -106,22 +109,56 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        use_fp8_kv = getattr(self.model, 'has_fp4_weights', False)
+        kv_dtype = torch.float8_e4m3fn if use_fp8_kv else hf_config.dtype
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        assert config.num_kvcache_blocks > 0, \
+            f"KV cache allocation failed: available={total * config.gpu_memory_utilization - used - peak + current}, block_bytes={block_bytes}"
+        num_layers = hf_config.num_hidden_layers
+        num_blocks = config.num_kvcache_blocks
+        if use_fp8_kv:
+            # FlashInfer layout: [num_layers, num_blocks, 2, block_size, num_kv_heads, head_dim]
+            self.kv_cache = torch.empty(num_layers, num_blocks, 2, self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.kv_cache[layer_id, :, 0]
+                    module.v_cache = self.kv_cache[layer_id, :, 1]
+                    module.kv_cache = self.kv_cache[layer_id]
+                    layer_id += 1
+        else:
+            # Original layout: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+            self.kv_cache = torch.empty(2, num_layers, num_blocks, self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+
+    def prepare_flashinfer_page_tables(self, seqs: list[Sequence]):
+        """Convert block_tables to FlashInfer (indptr, indices, last_page_len) format."""
+        kv_indptr = [0]
+        kv_indices = []
+        kv_last_page_len = []
+        for seq in seqs:
+            seq_len = len(seq)
+            num_pages = len(seq.block_table)
+            kv_indices.extend(seq.block_table)
+            kv_indptr.append(kv_indptr[-1] + num_pages)
+            last_len = seq_len - (num_pages - 1) * self.block_size
+            kv_last_page_len.append(last_len)
+        kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32, pin_memory=True)
+        kv_indices = torch.tensor(kv_indices, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        kv_last_page_len = torch.tensor(kv_last_page_len, dtype=torch.int32, pin_memory=True)
+        return kv_indptr, kv_indices, kv_last_page_len
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -158,7 +195,12 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        # Prepare FlashInfer page tables if needed
+        fi_indptr = fi_indices = fi_last_page_len = None
+        if self.use_flashinfer and seqs and seqs[0].block_table:
+            fi_indptr, fi_indices, fi_last_page_len = self.prepare_flashinfer_page_tables(seqs)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    flashinfer_kv_indptr=fi_indptr, flashinfer_kv_indices=fi_indices, flashinfer_kv_last_page_len=fi_last_page_len)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -176,7 +218,12 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        # Prepare FlashInfer page tables if needed
+        fi_indptr = fi_indices = fi_last_page_len = None
+        if self.use_flashinfer:
+            fi_indptr, fi_indices, fi_last_page_len = self.prepare_flashinfer_page_tables(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    flashinfer_kv_indptr=fi_indptr, flashinfer_kv_indices=fi_indices, flashinfer_kv_last_page_len=fi_last_page_len)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

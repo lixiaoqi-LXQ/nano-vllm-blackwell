@@ -183,9 +183,12 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    """Unified model supporting both BF16 and FP8.
+    """Unified model supporting BF16, FP8, and FP4.
 
-    FP8 is detected at load time by the presence of weight_scale_inv tensors.
+    Quantization type is detected at load time:
+    - FP4: weight_scale + weight_scale_2 + input_scale tensors present
+    - FP8: weight_scale_inv tensors present
+    - BF16: no scale tensors
     """
 
     packed_modules_mapping = {
@@ -205,8 +208,9 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        # Set by loader when FP8 weights are detected
+        # Set by loader when quantized weights are detected
         self.has_fp8_weights = False
+        self.has_fp4_weights = False
 
     def forward(
         self,
