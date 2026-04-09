@@ -1,4 +1,5 @@
 import pickle
+import psutil
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -105,7 +106,14 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
+        # On UMA platforms (Tegra SoC: Orin SM87, Thor SM110, Spark SM121),
+        # cudaMemGetInfo reports inflated "used" memory. Use psutil instead.
+        capability = torch.cuda.get_device_capability()
+        if capability in ((8, 7), (11, 0), (12, 1)):
+            total = psutil.virtual_memory().total
+            free = psutil.virtual_memory().available
+        else:
+            free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
