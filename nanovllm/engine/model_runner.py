@@ -11,6 +11,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.nvtx_utils import register_nvtx_hooks
 
 
 class ModelRunner:
@@ -31,6 +32,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        register_nvtx_hooks(self.model)
         self.use_fp8_kv = getattr(self.model, 'has_fp4_weights', False)
         self.use_flashinfer = self.use_fp8_kv
         print(f"FP8 KV Cache: {'enabled' if self.use_fp8_kv else 'disabled'}")
