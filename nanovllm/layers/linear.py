@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.fp8_utils import fp8_linear
+from nanovllm.utils.fp4_utils import fp4_linear
 
 
 def divide(numerator, denominator):
@@ -32,6 +33,13 @@ class LinearBase(nn.Module):
         # FP8 scale (inverse) - set by weight_loader if FP8 weights are loaded
         self.weight_scale_inv: Optional[torch.Tensor] = None
 
+        # FP4 scales - set by weight_loader if FP4 weights are loaded
+        # [N, K/16] float8_e4m3fn
+        self.weight_scale_fp4: Optional[torch.Tensor] = None
+        # scalar float32
+        self.weight_scale_2_fp4: Optional[torch.Tensor] = None
+        self.input_scale_fp4: Optional[torch.Tensor] = None  # scalar float32
+
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
@@ -43,6 +51,16 @@ class LinearBase(nn.Module):
         """Ensure parameter storage dtype matches loaded checkpoint dtype."""
         if param.data.dtype != target_dtype:
             param.data = param.data.to(dtype=target_dtype)
+
+    def _is_fp4(self) -> bool:
+        return self.weight_scale_fp4 is not None
+
+    def _fp4_forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self, "weight_fp4", self.weight)
+        return fp4_linear(
+            x, weight, self.weight_scale_fp4,
+            self.weight_scale_2_fp4, self.input_scale_fp4, self.bias
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -63,13 +81,29 @@ class ReplicatedLinear(LinearBase):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_scale: Optional[torch.Tensor] = None,
+        loaded_scale_2: Optional[torch.Tensor] = None,
+        loaded_input_scale: Optional[torch.Tensor] = None,
     ):
+        if loaded_weight.dtype == torch.uint8 and loaded_scale_2 is not None:
+            # FP4 path: store weight as buffer (uint8 can't be nn.Parameter)
+            self.register_buffer("weight_fp4", loaded_weight.cuda())
+            self.weight_scale_fp4 = loaded_scale.cuda()
+            self.weight_scale_2_fp4 = loaded_scale_2.cuda()
+            self.input_scale_fp4 = (
+                loaded_input_scale.cuda()
+                if loaded_input_scale is not None else None
+            )
+            # Free the original bf16 weight to save GPU memory
+            self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            return
         self._ensure_param_dtype(param, loaded_weight.dtype)
         param.data.copy_(loaded_weight)
         if loaded_scale is not None:
             self.weight_scale_inv = loaded_scale.to(param.data.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._is_fp4():
+            return self._fp4_forward(x)
         if self.weight_scale_inv is not None:
             return fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
         return F.linear(x, self.weight, self.bias)
@@ -91,9 +125,34 @@ class ColumnParallelLinear(LinearBase):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_scale: Optional[torch.Tensor] = None,
+        loaded_scale_2: Optional[torch.Tensor] = None,
+        loaded_input_scale: Optional[torch.Tensor] = None,
     ):
         tp_dim = self.tp_dim
         assert tp_dim is not None
+
+        if loaded_weight.dtype == torch.uint8 and loaded_scale_2 is not None:
+            # FP4 path: shard and store as buffer
+            shard_size = loaded_weight.size(tp_dim) // self.tp_size
+            start_idx = self.tp_rank * shard_size
+            weight_shard = loaded_weight.narrow(tp_dim, start_idx, shard_size)
+            self.register_buffer("weight_fp4", weight_shard.cuda())
+
+            # Shard scale along dimension 0
+            scale_shard_h = loaded_scale.size(0) // self.tp_size
+            scale_start = self.tp_rank * scale_shard_h
+            self.weight_scale_fp4 = loaded_scale[
+                scale_start: scale_start + scale_shard_h
+            ].cuda()
+            self.weight_scale_2_fp4 = loaded_scale_2.cuda()
+            self.input_scale_fp4 = (
+                loaded_input_scale.cuda()
+                if loaded_input_scale is not None else None
+            )
+            # Free the original bf16 weight to save GPU memory
+            self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            return
+
         self._ensure_param_dtype(param, loaded_weight.dtype)
         param_data = param.data
         shard_size = param_data.size(tp_dim)
@@ -110,6 +169,8 @@ class ColumnParallelLinear(LinearBase):
             ].to(param_data.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._is_fp4():
+            return self._fp4_forward(x)
         if self.weight_scale_inv is not None:
             return fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
         return F.linear(x, self.weight, self.bias)
@@ -127,8 +188,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         super().__init__(input_size, sum(output_sizes), bias)
         self._gate_size = self.output_sizes[0] // self.tp_size
 
-        # Store scales separately for each output (for FP8)
+        # Store scales separately for each output (for FP8/FP4)
         self.weight_scale_inv_list: list[Optional[torch.Tensor]] = [None, None]
+        # FP4 separate weights and scales per shard
+        self.weight_fp4_list: list[Optional[torch.Tensor]] = [None, None]
+        self.weight_scale_fp4_list: list[Optional[torch.Tensor]] = [None, None]
+        self.weight_scale_2_fp4_list: list[Optional[torch.Tensor]] = [
+            None, None]
+        self.input_scale_fp4_list: list[Optional[torch.Tensor]] = [None, None]
 
     def weight_loader(
         self,
@@ -136,8 +203,31 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int,
         loaded_scale: Optional[torch.Tensor] = None,
+        loaded_weight_scale_2: Optional[torch.Tensor] = None,
+        loaded_input_scale: Optional[torch.Tensor] = None,
     ):
         tp_dim = self.tp_dim
+
+        if loaded_weight.dtype == torch.uint8 and loaded_weight_scale_2 is not None:
+            # FP4 path: shard weight and store as separate buffer per shard
+            loaded_shard = loaded_weight.chunk(
+                self.tp_size, tp_dim)[self.tp_rank]
+            self.weight_fp4_list[loaded_shard_id] = loaded_shard.cuda()
+
+            scale_shard = loaded_scale.chunk(self.tp_size, 0)[self.tp_rank]
+            self.weight_scale_fp4_list[loaded_shard_id] = scale_shard.cuda()
+            self.weight_scale_2_fp4_list[loaded_shard_id] = (
+                loaded_weight_scale_2.cuda()
+            )
+            self.input_scale_fp4_list[loaded_shard_id] = (
+                loaded_input_scale.cuda()
+                if loaded_input_scale is not None else None
+            )
+            # Free the original bf16 weight once all FP4 shards are loaded
+            if all(w is not None for w in self.weight_fp4_list):
+                self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            return
+
         self._ensure_param_dtype(param, loaded_weight.dtype)
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
@@ -149,16 +239,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if loaded_scale is not None:
             # Shard scale and store separately
             scale_shard = loaded_scale.chunk(self.tp_size, 0)[self.tp_rank]
-            self.weight_scale_inv_list[loaded_shard_id] = scale_shard.to(
-                param_data.device)
+            scale_shard = scale_shard.to(param_data.device)
+            # FP8 path
+            self.weight_scale_inv_list[loaded_shard_id] = scale_shard
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight_scale_fp4_list[0] is not None:
+            # FP4 path: separate GEMM for gate and up using FP4 weight buffers
+            gate = fp4_linear(
+                x, self.weight_fp4_list[0], self.weight_scale_fp4_list[0],
+                self.weight_scale_2_fp4_list[0], self.input_scale_fp4_list[0]
+            )
+            up = fp4_linear(
+                x, self.weight_fp4_list[1], self.weight_scale_fp4_list[1],
+                self.weight_scale_2_fp4_list[1], self.input_scale_fp4_list[1]
+            )
+            return torch.cat([gate, up], dim=-1)
+
         if self.weight_scale_inv_list[0] is not None:
             # FP8 path: separate GEMM for gate and up
             gate_scale, up_scale = self.weight_scale_inv_list
             gate_weight = self.weight[: self._gate_size]
             up_weight = self.weight[self._gate_size:]
-
             gate = fp8_linear(x, gate_weight, gate_scale)
             up = fp8_linear(x, up_weight, up_scale)
             return torch.cat([gate, up], dim=-1)
@@ -193,8 +295,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         self._v_slice = slice(self.q_size + self.kv_size,
                               self.q_size + 2 * self.kv_size)
 
-        # Store scales separately for Q, K, V (for FP8)
+        # Store scales separately for Q, K, V (for FP8/FP4)
         self.weight_scale_inv_list: list[Optional[torch.Tensor]] = [
+            None, None, None]
+        # FP4 separate weights and scales per shard
+        self.weight_fp4_list: list[Optional[torch.Tensor]] = [
+            None, None, None]
+        self.weight_scale_fp4_list: list[Optional[torch.Tensor]] = [
+            None, None, None]
+        self.weight_scale_2_fp4_list: list[Optional[torch.Tensor]] = [
+            None, None, None]
+        self.input_scale_fp4_list: list[Optional[torch.Tensor]] = [
             None, None, None]
 
     def weight_loader(
@@ -203,9 +314,33 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str,
         loaded_scale: Optional[torch.Tensor] = None,
+        loaded_weight_scale_2: Optional[torch.Tensor] = None,
+        loaded_input_scale: Optional[torch.Tensor] = None,
     ):
         assert loaded_shard_id in self._SHARD_TO_INDEX
         tp_dim = self.tp_dim
+        idx = self._SHARD_TO_INDEX[loaded_shard_id]
+
+        if loaded_weight.dtype == torch.uint8 and loaded_weight_scale_2 is not None:
+            # FP4 path: shard weight and store as separate buffer per shard
+            loaded_shard = loaded_weight.chunk(
+                self.tp_size, tp_dim)[self.tp_rank]
+            self.weight_fp4_list[idx] = loaded_shard.cuda()
+
+            scale_shard = loaded_scale.chunk(self.tp_size, 0)[self.tp_rank]
+            self.weight_scale_fp4_list[idx] = scale_shard.cuda()
+            self.weight_scale_2_fp4_list[idx] = (
+                loaded_weight_scale_2.cuda()
+            )
+            self.input_scale_fp4_list[idx] = (
+                loaded_input_scale.cuda()
+                if loaded_input_scale is not None else None
+            )
+            # Free the original bf16 weight once all FP4 shards are loaded
+            if all(w is not None for w in self.weight_fp4_list):
+                self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            return
+
         self._ensure_param_dtype(param, loaded_weight.dtype)
         param_data = param.data
 
@@ -224,19 +359,40 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
         if loaded_scale is not None:
-            # Shard scale and store separately
             scale_shard = loaded_scale.chunk(self.tp_size, 0)[self.tp_rank]
-            self.weight_scale_inv_list[self._SHARD_TO_INDEX[loaded_shard_id]] = scale_shard.to(
-                param_data.device)
+            scale_shard = scale_shard.to(param_data.device)
+            # FP8 path
+            self.weight_scale_inv_list[idx] = scale_shard
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight_scale_fp4_list[0] is not None:
+            # FP4 path: separate GEMM for Q, K, V using FP4 weight buffers
+            q = fp4_linear(
+                x, self.weight_fp4_list[0],
+                self.weight_scale_fp4_list[0],
+                self.weight_scale_2_fp4_list[0],
+                self.input_scale_fp4_list[0]
+            )
+            k = fp4_linear(
+                x, self.weight_fp4_list[1],
+                self.weight_scale_fp4_list[1],
+                self.weight_scale_2_fp4_list[1],
+                self.input_scale_fp4_list[1]
+            )
+            v = fp4_linear(
+                x, self.weight_fp4_list[2],
+                self.weight_scale_fp4_list[2],
+                self.weight_scale_2_fp4_list[2],
+                self.input_scale_fp4_list[2]
+            )
+            return torch.cat([q, k, v], dim=-1)
+
         if self.weight_scale_inv_list[0] is not None:
             # FP8 path: separate GEMM for Q, K, V
             q_scale, k_scale, v_scale = self.weight_scale_inv_list
             q_weight = self.weight[self._q_slice]
             k_weight = self.weight[self._k_slice]
             v_weight = self.weight[self._v_slice]
-
             q = fp8_linear(x, q_weight, q_scale)
             k = fp8_linear(x, k_weight, k_scale)
             v = fp8_linear(x, v_weight, v_scale)
@@ -261,8 +417,33 @@ class RowParallelLinear(LinearBase):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_scale: Optional[torch.Tensor] = None,
+        loaded_scale_2: Optional[torch.Tensor] = None,
+        loaded_input_scale: Optional[torch.Tensor] = None,
     ):
         tp_dim = self.tp_dim
+
+        if loaded_weight.dtype == torch.uint8 and loaded_scale_2 is not None:
+            # FP4 path: shard along dim 1 and store as buffer
+            shard_size = loaded_weight.size(tp_dim) // self.tp_size
+            start_idx = self.tp_rank * shard_size
+            weight_shard = loaded_weight.narrow(tp_dim, start_idx, shard_size)
+            self.register_buffer("weight_fp4", weight_shard.cuda())
+
+            # Shard scale along dimension 1
+            scale_shard_w = loaded_scale.size(1) // self.tp_size
+            scale_start = self.tp_rank * scale_shard_w
+            self.weight_scale_fp4 = loaded_scale[
+                :, scale_start: scale_start + scale_shard_w
+            ].cuda()
+            self.weight_scale_2_fp4 = loaded_scale_2.cuda()
+            self.input_scale_fp4 = (
+                loaded_input_scale.cuda()
+                if loaded_input_scale is not None else None
+            )
+            # Free the original bf16 weight to save GPU memory
+            self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            return
+
         self._ensure_param_dtype(param, loaded_weight.dtype)
         param_data = param.data
         shard_size = param_data.size(tp_dim)
@@ -274,12 +455,15 @@ class RowParallelLinear(LinearBase):
             # Shard scale along dimension 1
             scale_shard_w = loaded_scale.size(1) // self.tp_size
             scale_start = self.tp_rank * scale_shard_w
-            self.weight_scale_inv = loaded_scale[
+            scale_sharded = loaded_scale[
                 :, scale_start: scale_start + scale_shard_w
             ].to(param_data.device)
+            self.weight_scale_inv = scale_sharded
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight_scale_inv is not None:
+        if self._is_fp4():
+            y = self._fp4_forward(x)
+        elif self.weight_scale_inv is not None:
             y = fp8_linear(
                 x, self.weight, self.weight_scale_inv,
                 self.bias if self.tp_rank == 0 else None

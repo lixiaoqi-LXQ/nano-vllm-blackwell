@@ -55,12 +55,49 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.kv_cache = None  # FlashInfer combined kv cache [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        self.k_scale = None
+        self.v_scale = None
+        # FlashInfer wrappers (lazy init)
+        self._prefill_wrapper = None
+        self._decode_wrapper = None
+        self._flashinfer_workspace = None
+
+    @property
+    def use_fp8_kv(self):
+        return self.k_scale is not None
+
+    def _ensure_flashinfer_wrappers(self):
+        if self._prefill_wrapper is None:
+            from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+            workspace = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda")
+            self._flashinfer_workspace = workspace
+            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+        if self._decode_wrapper is None:
+            from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+            workspace = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda")
+            self._decode_workspace = workspace
+            self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace, "NHD", use_tensor_cores=True,
+            )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+
+        # Store to cache
         if k_cache.numel() and v_cache.numel():
+            if self.use_fp8_kv:
+                k = (k / self.k_scale).to(torch.float8_e4m3fn)
+                v = (v / self.v_scale).to(torch.float8_e4m3fn)
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        if self.use_fp8_kv and self.kv_cache is not None:
+            return self._flashinfer_forward(q, k_cache, v_cache, context)
+        else:
+            return self._flashattn_forward(q, k, v, k_cache, v_cache, context)
+
+    def _flashattn_forward(self, q, k, v, k_cache, v_cache, context):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -70,6 +107,51 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
+        return o
+
+    def _flashinfer_forward(self, q, k_cache, v_cache, context):
+        self._ensure_flashinfer_wrappers()
+
+        kv_cache = self.kv_cache
+
+        block_size = k_cache.size(1)
+        q_dtype = q.dtype
+        kv_dtype = k_cache.dtype
+
+        if context.is_prefill:
+            wrapper = self._prefill_wrapper
+            wrapper.plan(
+                context.cu_seqlens_q,
+                context.flashinfer_kv_indptr,
+                context.flashinfer_kv_indices,
+                context.flashinfer_kv_last_page_len,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                block_size,
+                causal=True,
+                sm_scale=self.scale,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+            )
+            o = wrapper.run(q, kv_cache, k_scale=self.k_scale.item(), v_scale=self.v_scale.item())
+        else:
+            wrapper = self._decode_wrapper
+            wrapper.plan(
+                context.flashinfer_kv_indptr,
+                context.flashinfer_kv_indices,
+                context.flashinfer_kv_last_page_len,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                block_size,
+                "NONE",
+                sm_scale=self.scale,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+            )
+            o = wrapper.run(q, kv_cache, k_scale=self.k_scale.item(), v_scale=self.v_scale.item())
+
         return o
