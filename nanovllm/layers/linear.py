@@ -242,6 +242,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             scale_shard = scale_shard.to(param_data.device)
             # FP8 path
             self.weight_scale_inv_list[loaded_shard_id] = scale_shard
+            # Pre-merge scales once all shards are loaded
+            if all(s is not None for s in self.weight_scale_inv_list):
+                self.weight_scale_inv = torch.cat(
+                    self.weight_scale_inv_list, dim=0)
+                self.weight_scale_inv_list = [None, None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight_scale_fp4_list[0] is not None:
@@ -256,14 +261,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             )
             return torch.cat([gate, up], dim=-1)
 
-        if self.weight_scale_inv_list[0] is not None:
-            # FP8 path: separate GEMM for gate and up
-            gate_scale, up_scale = self.weight_scale_inv_list
-            gate_weight = self.weight[: self._gate_size]
-            up_weight = self.weight[self._gate_size:]
-            gate = fp8_linear(x, gate_weight, gate_scale)
-            up = fp8_linear(x, up_weight, up_scale)
-            return torch.cat([gate, up], dim=-1)
+        if self.weight_scale_inv is not None:
+            return fp8_linear(x, self.weight, self.weight_scale_inv)
 
         return F.linear(x, self.weight, self.bias)
 
@@ -363,6 +362,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             scale_shard = scale_shard.to(param_data.device)
             # FP8 path
             self.weight_scale_inv_list[idx] = scale_shard
+            # Pre-merge scales once all shards are loaded
+            if all(s is not None for s in self.weight_scale_inv_list):
+                self.weight_scale_inv = torch.cat(
+                    self.weight_scale_inv_list, dim=0)
+                self.weight_scale_inv_list = [None, None, None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight_scale_fp4_list[0] is not None:
@@ -387,16 +391,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             )
             return torch.cat([q, k, v], dim=-1)
 
-        if self.weight_scale_inv_list[0] is not None:
-            # FP8 path: separate GEMM for Q, K, V
-            q_scale, k_scale, v_scale = self.weight_scale_inv_list
-            q_weight = self.weight[self._q_slice]
-            k_weight = self.weight[self._k_slice]
-            v_weight = self.weight[self._v_slice]
-            q = fp8_linear(x, q_weight, q_scale)
-            k = fp8_linear(x, k_weight, k_scale)
-            v = fp8_linear(x, v_weight, v_scale)
-            return torch.cat([q, k, v], dim=-1)
+        if self.weight_scale_inv is not None:
+            return fp8_linear(x, self.weight, self.weight_scale_inv)
 
         return F.linear(x, self.weight, self.bias)
 
