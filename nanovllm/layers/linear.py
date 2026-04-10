@@ -223,8 +223,26 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 loaded_input_scale.cuda()
                 if loaded_input_scale is not None else None
             )
-            # Free the original bf16 weight once all FP4 shards are loaded
+            # Merge FP4 weights once all shards are loaded
             if all(w is not None for w in self.weight_fp4_list):
+                assert all(
+                    torch.equal(self.weight_scale_2_fp4_list[0], s)
+                    for s in self.weight_scale_2_fp4_list[1:]
+                ), "weight_scale_2 must be identical across shards"
+                assert all(
+                    torch.equal(self.input_scale_fp4_list[0], s)
+                    for s in self.input_scale_fp4_list[1:]
+                ), "input_scale must be identical across shards"
+                self.register_buffer("weight_fp4",
+                                     torch.cat(self.weight_fp4_list, dim=0))
+                self.weight_scale_fp4 = torch.cat(
+                    self.weight_scale_fp4_list, dim=0)
+                self.weight_scale_2_fp4 = self.weight_scale_2_fp4_list[0]
+                self.input_scale_fp4 = self.input_scale_fp4_list[0]
+                self.weight_fp4_list = [None, None]
+                self.weight_scale_fp4_list = [None, None]
+                self.weight_scale_2_fp4_list = [None, None]
+                self.input_scale_fp4_list = [None, None]
                 self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
             return
 
@@ -249,17 +267,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.weight_scale_inv_list = [None, None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight_scale_fp4_list[0] is not None:
-            # FP4 path: separate GEMM for gate and up using FP4 weight buffers
-            gate = fp4_linear(
-                x, self.weight_fp4_list[0], self.weight_scale_fp4_list[0],
-                self.weight_scale_2_fp4_list[0], self.input_scale_fp4_list[0]
-            )
-            up = fp4_linear(
-                x, self.weight_fp4_list[1], self.weight_scale_fp4_list[1],
-                self.weight_scale_2_fp4_list[1], self.input_scale_fp4_list[1]
-            )
-            return torch.cat([gate, up], dim=-1)
+        if self._is_fp4():
+            return self._fp4_forward(x)
 
         if self.weight_scale_inv is not None:
             return fp8_linear(x, self.weight, self.weight_scale_inv)
@@ -335,8 +344,26 @@ class QKVParallelLinear(ColumnParallelLinear):
                 loaded_input_scale.cuda()
                 if loaded_input_scale is not None else None
             )
-            # Free the original bf16 weight once all FP4 shards are loaded
+            # Merge FP4 weights once all shards are loaded
             if all(w is not None for w in self.weight_fp4_list):
+                assert all(
+                    torch.equal(self.weight_scale_2_fp4_list[0], s)
+                    for s in self.weight_scale_2_fp4_list[1:]
+                ), "weight_scale_2 must be identical across shards"
+                assert all(
+                    torch.equal(self.input_scale_fp4_list[0], s)
+                    for s in self.input_scale_fp4_list[1:]
+                ), "input_scale must be identical across shards"
+                self.register_buffer("weight_fp4",
+                                     torch.cat(self.weight_fp4_list, dim=0))
+                self.weight_scale_fp4 = torch.cat(
+                    self.weight_scale_fp4_list, dim=0)
+                self.weight_scale_2_fp4 = self.weight_scale_2_fp4_list[0]
+                self.input_scale_fp4 = self.input_scale_fp4_list[0]
+                self.weight_fp4_list = [None, None, None]
+                self.weight_scale_fp4_list = [None, None, None]
+                self.weight_scale_2_fp4_list = [None, None, None]
+                self.input_scale_fp4_list = [None, None, None]
                 self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
             return
 
@@ -369,27 +396,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.weight_scale_inv_list = [None, None, None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight_scale_fp4_list[0] is not None:
-            # FP4 path: separate GEMM for Q, K, V using FP4 weight buffers
-            q = fp4_linear(
-                x, self.weight_fp4_list[0],
-                self.weight_scale_fp4_list[0],
-                self.weight_scale_2_fp4_list[0],
-                self.input_scale_fp4_list[0]
-            )
-            k = fp4_linear(
-                x, self.weight_fp4_list[1],
-                self.weight_scale_fp4_list[1],
-                self.weight_scale_2_fp4_list[1],
-                self.input_scale_fp4_list[1]
-            )
-            v = fp4_linear(
-                x, self.weight_fp4_list[2],
-                self.weight_scale_fp4_list[2],
-                self.weight_scale_2_fp4_list[2],
-                self.input_scale_fp4_list[2]
-            )
-            return torch.cat([q, k, v], dim=-1)
+        if self._is_fp4():
+            return self._fp4_forward(x)
 
         if self.weight_scale_inv is not None:
             return fp8_linear(x, self.weight, self.weight_scale_inv)
