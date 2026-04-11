@@ -1,3 +1,5 @@
+import json
+import os
 import pickle
 import psutil
 import torch
@@ -8,8 +10,10 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.layers.linear import LinearBase
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.fp4_utils import fp4_linear, fp4_linear_chunked
 from nanovllm.utils.loader import load_model
 
 
@@ -37,6 +41,8 @@ class ModelRunner:
         # FP4 models with FlashInfer do not support CUDA graphs (plan() requires host-side compute)
         self.enforce_eager = self.enforce_eager or self.use_fp8_kv
         self.sampler = Sampler()
+        if getattr(self.model, 'has_fp4_weights', False) and self.config.fp4_profile:
+            self._profile_fp4_dispatch()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -305,3 +311,148 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    # ------------------------------------------------------------------
+    # FP4 chunk dispatch profiling
+    # ------------------------------------------------------------------
+
+    def _get_fp4_layers(self):
+        """Return list of (module, K, N) for all FP4 linear layers."""
+        layers = []
+        for _, module in self.model.named_modules():
+            if isinstance(module, LinearBase) and module._is_fp4():
+                weight = getattr(module, "weight_fp4", None)
+                if weight is not None:
+                    N = weight.size(0)
+                    K = weight.size(1) * 2  # packed uint8, 2 values per byte
+                    layers.append((module, K, N))
+        return layers
+
+    @staticmethod
+    def _bench_fn(fn, warmup, iters):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
+    @torch.inference_mode()
+    def _profile_fp4_dispatch(self):
+        """Profile FP4 layers to determine optimal chunk_size per shape."""
+        cache_path = os.path.join(
+            self.config.model, ".fp4_dispatch_cache.json")
+
+        # Try loading cached results
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path) as f:
+                    cache = json.load(f)
+                gpu_name = torch.cuda.get_device_name()
+                if cache.get("gpu") == gpu_name:
+                    self._apply_fp4_dispatch(cache["dispatch"])
+                    print(f"FP4 dispatch: loaded cache for {gpu_name}")
+                    return
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        layers = self._get_fp4_layers()
+        if not layers:
+            return
+
+        # Find unique (K, N) shapes with one representative module each
+        shapes = {}
+        for module, K, N in layers:
+            key = (K, N)
+            if key not in shapes:
+                shapes[key] = module
+
+        CHUNK_SIZES = [1024, 2048, 4096]
+        PROFILE_MS = [M for M in [1024, 2048, 4096, 8192, 16384]
+                      if M > min(CHUNK_SIZES)]
+        WARMUP = 3
+        ITERS = 10
+
+        dispatch = {}  # "K,N" -> chunk_size (0 = no chunking)
+
+        for (K, N), layer in shapes.items():
+            weight = layer.weight_fp4
+            scale_args = (layer.weight_scale_fp4,
+                          layer.weight_scale_2_fp4, layer.input_scale_fp4)
+
+            chunk_speedups = {cs: [] for cs in CHUNK_SIZES}
+
+            print(f"FP4 profiling: K={K}, N={N}")
+            print(f"  {'M':>6}  {'vanilla(ms)':>11}  "
+                  + "  ".join(f"C{cs}(ms)" for cs in CHUNK_SIZES))
+
+            x_buf = torch.randn(max(PROFILE_MS), K,
+                                dtype=torch.bfloat16, device="cuda")
+
+            for M in PROFILE_MS:
+                x = x_buf[:M]
+
+                vanilla_ms = self._bench_fn(
+                    lambda: fp4_linear(x, weight, *scale_args),
+                    WARMUP, ITERS)
+
+                row = f"  {M:>6}  {vanilla_ms:>11.3f}"
+
+                for cs in CHUNK_SIZES:
+                    if M <= cs:
+                        row += f"  {'--':>9}"
+                        continue
+                    chunked_ms = self._bench_fn(
+                        lambda: fp4_linear_chunked(
+                            x, weight, *scale_args, chunk_size=cs),
+                        WARMUP, ITERS)
+                    if vanilla_ms > 0:
+                        chunk_speedups[cs].append(vanilla_ms / chunked_ms)
+                    row += f"  {chunked_ms:>9.3f}"
+
+                print(row)
+
+            del x_buf
+            torch.cuda.empty_cache()
+
+            # Pick chunk_size with best average speedup (must be > 1.0)
+            best_chunk = 0
+            best_avg_speedup = 1.0
+            for cs in CHUNK_SIZES:
+                if chunk_speedups[cs]:
+                    avg_speedup = sum(
+                        chunk_speedups[cs]) / len(chunk_speedups[cs])
+                    if avg_speedup > best_avg_speedup:
+                        best_avg_speedup = avg_speedup
+                        best_chunk = cs
+
+            key = f"{K},{N}"
+            dispatch[key] = best_chunk
+            if best_chunk > 0:
+                print(f"  -> chunk_size={best_chunk} (avg speedup {best_avg_speedup:.2f}x over vanilla)\n")
+            else:
+                print(f"  -> no chunking (chunking not faster)\n")
+
+        # Cache results
+        cache = {
+            "gpu": torch.cuda.get_device_name(),
+            "dispatch": dispatch,
+        }
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(cache, f, indent=2)
+        except OSError:
+            pass  # Model dir may be read-only
+
+        self._apply_fp4_dispatch(dispatch)
+
+    def _apply_fp4_dispatch(self, dispatch):
+        """Apply dispatch table to all FP4 layers."""
+        for module, K, N in self._get_fp4_layers():
+            key = f"{K},{N}"
+            module._fp4_chunk_size = dispatch.get(key, 0)

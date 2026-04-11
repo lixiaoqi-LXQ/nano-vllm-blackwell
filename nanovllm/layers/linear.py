@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.fp8_utils import fp8_linear
-from nanovllm.utils.fp4_utils import fp4_linear
+from nanovllm.utils.fp4_utils import fp4_linear, fp4_linear_chunked
 
 
 def divide(numerator, denominator):
@@ -40,6 +40,9 @@ class LinearBase(nn.Module):
         self.weight_scale_2_fp4: Optional[torch.Tensor] = None
         self.input_scale_fp4: Optional[torch.Tensor] = None  # scalar float32
 
+        # FP4 chunk dispatch (set by ModelRunner after profiling)
+        self._fp4_chunk_size: int = 0
+
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
@@ -57,6 +60,11 @@ class LinearBase(nn.Module):
 
     def _fp4_forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self, "weight_fp4", self.weight)
+        if self._fp4_chunk_size > 0 and x.size(0) > self._fp4_chunk_size:
+            return fp4_linear_chunked(
+                x, weight, self.weight_scale_fp4,
+                self.weight_scale_2_fp4, self.input_scale_fp4, self.bias,
+                chunk_size=self._fp4_chunk_size)
         return fp4_linear(
             x, weight, self.weight_scale_fp4,
             self.weight_scale_2_fp4, self.input_scale_fp4, self.bias

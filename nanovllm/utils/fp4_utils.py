@@ -354,6 +354,49 @@ def fp4_linear(
         )
 
 
+def fp4_linear_chunked(
+    x: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """FP4 linear with M-dimension chunking for large batches.
+
+    Splits the input along dim 0 into chunks of `chunk_size`, runs fp4_linear
+    on each chunk, and concatenates the results. This avoids CUTLASS tile
+    scheduling inefficiencies with very large M values.
+
+    Args:
+        x: Input tensor [M, K] in BF16
+        weight_fp4: [N, K/2] uint8 packed FP4 values
+        weight_scale: [N, K/16] float8_e4m3fn block scales
+        weight_scale_2: scalar float32 global scale
+        input_scale: scalar float32 activation scale
+        bias: Optional bias [N]
+        chunk_size: Maximum rows per chunk
+
+    Returns:
+        Output tensor [M, N] in BF16
+    """
+    M = x.size(0)
+    if M <= chunk_size:
+        return fp4_linear(x, weight_fp4, weight_scale,
+                          weight_scale_2, input_scale, bias)
+    chunks = []
+    for i in range(0, M, chunk_size):
+        out_i = fp4_linear(
+            x[i:i + chunk_size], weight_fp4, weight_scale,
+            weight_scale_2, input_scale, None)
+        chunks.append(out_i)
+    result = torch.cat(chunks, dim=0)
+    if bias is not None:
+        result = result + bias
+    return result
+
+
 def get_fp4_info() -> str:
     """Get FP4 support information for logging."""
     if not torch.cuda.is_available():
