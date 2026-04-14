@@ -14,6 +14,7 @@ from nanovllm.layers.linear import LinearBase
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.fp4_utils import fp4_linear, fp4_linear_chunked
+from nanovllm.utils.fp8_utils import fp8_linear, fp8_linear_chunked
 from nanovllm.utils.loader import load_model
 
 
@@ -41,8 +42,9 @@ class ModelRunner:
         # FP4 models with FlashInfer do not support CUDA graphs (plan() requires host-side compute)
         self.enforce_eager = self.enforce_eager or self.use_fp8_kv
         self.sampler = Sampler()
-        if getattr(self.model, 'has_fp4_weights', False) and self.config.fp4_profile:
-            self._profile_fp4_dispatch()
+        has_quant = getattr(self.model, 'has_fp4_weights', False) or getattr(self.model, 'has_fp8_weights', False)
+        if has_quant and self.config.quant_profile:
+            self._profile_dispatch()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -313,19 +315,26 @@ class ModelRunner:
         )
 
     # ------------------------------------------------------------------
-    # FP4 chunk dispatch profiling
+    # Quantized linear chunk dispatch profiling
     # ------------------------------------------------------------------
 
-    def _get_fp4_layers(self):
-        """Return list of (module, K, N) for all FP4 linear layers."""
+    def _get_quantized_layers(self):
+        """Return list of (module, K, N, quant_type) for all quantized linear layers."""
         layers = []
         for _, module in self.model.named_modules():
-            if isinstance(module, LinearBase) and module._is_fp4():
+            if not isinstance(module, LinearBase):
+                continue
+            if module._is_fp4():
                 weight = getattr(module, "weight_fp4", None)
                 if weight is not None:
                     N = weight.size(0)
                     K = weight.size(1) * 2  # packed uint8, 2 values per byte
-                    layers.append((module, K, N))
+                    layers.append((module, K, N, "fp4"))
+            elif module.weight_scale_inv is not None:
+                weight = module.weight
+                N = weight.size(0)
+                K = weight.size(1)
+                layers.append((module, K, N, "fp8"))
         return layers
 
     @staticmethod
@@ -343,10 +352,10 @@ class ModelRunner:
         return start.elapsed_time(end) / iters
 
     @torch.inference_mode()
-    def _profile_fp4_dispatch(self):
-        """Profile FP4 layers to determine optimal chunk_size per shape."""
+    def _profile_dispatch(self):
+        """Profile quantized layers to determine optimal chunk_size per shape."""
         cache_path = os.path.join(
-            self.config.model, ".fp4_dispatch_cache.json")
+            self.config.model, ".dispatch_cache.json")
 
         # Try loading cached results
         if os.path.isfile(cache_path):
@@ -355,20 +364,20 @@ class ModelRunner:
                     cache = json.load(f)
                 gpu_name = torch.cuda.get_device_name()
                 if cache.get("gpu") == gpu_name:
-                    self._apply_fp4_dispatch(cache["dispatch"])
-                    print(f"FP4 dispatch: loaded cache for {gpu_name}")
+                    self._apply_dispatch(cache["dispatch"])
+                    print(f"Dispatch: loaded cache for {gpu_name}")
                     return
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        layers = self._get_fp4_layers()
+        layers = self._get_quantized_layers()
         if not layers:
             return
 
-        # Find unique (K, N) shapes with one representative module each
+        # Find unique (K, N, quant_type) shapes with one representative module each
         shapes = {}
-        for module, K, N in layers:
-            key = (K, N)
+        for module, K, N, quant_type in layers:
+            key = (K, N, quant_type)
             if key not in shapes:
                 shapes[key] = module
 
@@ -378,28 +387,40 @@ class ModelRunner:
         WARMUP = 3
         ITERS = 10
 
-        dispatch = {}  # "K,N" -> chunk_size (0 = no chunking)
+        dispatch = {}  # "quant_type,K,N" -> chunk_size (0 = no chunking)
 
-        for (K, N), layer in shapes.items():
-            weight = layer.weight_fp4
-            scale_args = (layer.weight_scale_fp4,
-                          layer.weight_scale_2_fp4, layer.input_scale_fp4)
-
+        for (K, N, quant_type), layer in shapes.items():
             chunk_speedups = {cs: [] for cs in CHUNK_SIZES}
 
-            print(f"FP4 profiling: K={K}, N={N}")
+            print(f"{quant_type.upper()} profiling: K={K}, N={N}")
             print(f"  {'M':>6}  {'vanilla(ms)':>11}  "
                   + "  ".join(f"C{cs}(ms)" for cs in CHUNK_SIZES))
 
             x_buf = torch.randn(max(PROFILE_MS), K,
                                 dtype=torch.bfloat16, device="cuda")
 
+            # Build quantized-linear closure based on type
+            if quant_type == "fp4":
+                weight = layer.weight_fp4
+                scale_args = (layer.weight_scale_fp4,
+                              layer.weight_scale_2_fp4, layer.input_scale_fp4)
+                def vanilla_fn(x, _w=weight, _s=scale_args):
+                    return fp4_linear(x, _w, *_s)
+                def chunked_fn(x, _w=weight, _s=scale_args, _cs=4096):
+                    return fp4_linear_chunked(x, _w, *_s, chunk_size=_cs)
+            else:  # fp8
+                weight = layer.weight
+                scale_inv = layer.weight_scale_inv
+                def vanilla_fn(x, _w=weight, _si=scale_inv):
+                    return fp8_linear(x, _w, _si)
+                def chunked_fn(x, _w=weight, _si=scale_inv, _cs=4096):
+                    return fp8_linear_chunked(x, _w, _si, chunk_size=_cs)
+
             for M in PROFILE_MS:
                 x = x_buf[:M]
 
                 vanilla_ms = self._bench_fn(
-                    lambda: fp4_linear(x, weight, *scale_args),
-                    WARMUP, ITERS)
+                    lambda _x=x: vanilla_fn(_x), WARMUP, ITERS)
 
                 row = f"  {M:>6}  {vanilla_ms:>11.3f}"
 
@@ -408,8 +429,7 @@ class ModelRunner:
                         row += f"  {'--':>9}"
                         continue
                     chunked_ms = self._bench_fn(
-                        lambda: fp4_linear_chunked(
-                            x, weight, *scale_args, chunk_size=cs),
+                        lambda _x=x, _cs=cs: chunked_fn(_x, _cs=_cs),
                         WARMUP, ITERS)
                     if vanilla_ms > 0:
                         chunk_speedups[cs].append(vanilla_ms / chunked_ms)
@@ -431,7 +451,7 @@ class ModelRunner:
                         best_avg_speedup = avg_speedup
                         best_chunk = cs
 
-            key = f"{K},{N}"
+            key = f"{quant_type},{K},{N}"
             dispatch[key] = best_chunk
             if best_chunk > 0:
                 print(f"  -> chunk_size={best_chunk} (avg speedup {best_avg_speedup:.2f}x over vanilla)\n")
@@ -449,10 +469,10 @@ class ModelRunner:
         except OSError:
             pass  # Model dir may be read-only
 
-        self._apply_fp4_dispatch(dispatch)
+        self._apply_dispatch(dispatch)
 
-    def _apply_fp4_dispatch(self, dispatch):
-        """Apply dispatch table to all FP4 layers."""
-        for module, K, N in self._get_fp4_layers():
-            key = f"{K},{N}"
-            module._fp4_chunk_size = dispatch.get(key, 0)
+    def _apply_dispatch(self, dispatch):
+        """Apply dispatch table to all quantized layers."""
+        for module, K, N, quant_type in self._get_quantized_layers():
+            key = f"{quant_type},{K},{N}"
+            module._chunk_size = dispatch.get(key, 0)

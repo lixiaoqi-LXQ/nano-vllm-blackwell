@@ -248,6 +248,29 @@ def fp8_linear(
     return _fp8_linear_fallback(input, weight_fp8, weight_scale_inv, bias, block_size)
 
 
+def fp8_linear_chunked(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    block_size: Tuple[int, int] = DEFAULT_BLOCK_SIZE,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """FP8 linear with M-dimension chunking for large batches."""
+    M = input.size(0)
+    if M <= chunk_size:
+        return fp8_linear(input, weight_fp8, weight_scale_inv, bias, block_size)
+    chunks = []
+    for i in range(0, M, chunk_size):
+        out_i = fp8_linear(
+            input[i:i + chunk_size], weight_fp8, weight_scale_inv, None, block_size)
+        chunks.append(out_i)
+    result = torch.cat(chunks, dim=0)
+    if bias is not None:
+        result = result + bias
+    return result
+
+
 def get_fp8_info() -> str:
     """Get FP8 support information for logging.
 

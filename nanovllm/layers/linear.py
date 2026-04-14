@@ -5,7 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.utils.fp8_utils import fp8_linear
+from nanovllm.utils.fp8_utils import fp8_linear, fp8_linear_chunked
 from nanovllm.utils.fp4_utils import fp4_linear, fp4_linear_chunked
 
 
@@ -40,8 +40,8 @@ class LinearBase(nn.Module):
         self.weight_scale_2_fp4: Optional[torch.Tensor] = None
         self.input_scale_fp4: Optional[torch.Tensor] = None  # scalar float32
 
-        # FP4 chunk dispatch (set by ModelRunner after profiling)
-        self._fp4_chunk_size: int = 0
+        # Chunk dispatch (set by ModelRunner after profiling)
+        self._chunk_size: int = 0
 
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
@@ -60,15 +60,23 @@ class LinearBase(nn.Module):
 
     def _fp4_forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self, "weight_fp4", self.weight)
-        if self._fp4_chunk_size > 0 and x.size(0) > self._fp4_chunk_size:
+        if self._chunk_size > 0 and x.size(0) > self._chunk_size:
             return fp4_linear_chunked(
                 x, weight, self.weight_scale_fp4,
                 self.weight_scale_2_fp4, self.input_scale_fp4, self.bias,
-                chunk_size=self._fp4_chunk_size)
+                chunk_size=self._chunk_size)
         return fp4_linear(
             x, weight, self.weight_scale_fp4,
             self.weight_scale_2_fp4, self.input_scale_fp4, self.bias
         )
+
+    def _fp8_forward(self, x: torch.Tensor, bias_override: Optional[torch.Tensor] = None) -> torch.Tensor:
+        bias = bias_override if bias_override is not None else self.bias
+        if self._chunk_size > 0 and x.size(0) > self._chunk_size:
+            return fp8_linear_chunked(
+                x, self.weight, self.weight_scale_inv, bias,
+                chunk_size=self._chunk_size)
+        return fp8_linear(x, self.weight, self.weight_scale_inv, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -113,7 +121,7 @@ class ReplicatedLinear(LinearBase):
         if self._is_fp4():
             return self._fp4_forward(x)
         if self.weight_scale_inv is not None:
-            return fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
+            return self._fp8_forward(x)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -180,7 +188,7 @@ class ColumnParallelLinear(LinearBase):
         if self._is_fp4():
             return self._fp4_forward(x)
         if self.weight_scale_inv is not None:
-            return fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
+            return self._fp8_forward(x)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -279,7 +287,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return self._fp4_forward(x)
 
         if self.weight_scale_inv is not None:
-            return fp8_linear(x, self.weight, self.weight_scale_inv)
+            return self._fp8_forward(x)
 
         return F.linear(x, self.weight, self.bias)
 
@@ -408,7 +416,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             return self._fp4_forward(x)
 
         if self.weight_scale_inv is not None:
-            return fp8_linear(x, self.weight, self.weight_scale_inv)
+            return self._fp8_forward(x)
 
         return F.linear(x, self.weight, self.bias)
 
@@ -476,9 +484,8 @@ class RowParallelLinear(LinearBase):
         if self._is_fp4():
             y = self._fp4_forward(x)
         elif self.weight_scale_inv is not None:
-            y = fp8_linear(
-                x, self.weight, self.weight_scale_inv,
-                self.bias if self.tp_rank == 0 else None
+            y = self._fp8_forward(
+                x, bias_override=self.bias if self.tp_rank == 0 else None
             )
         else:
             y = F.linear(x, self.weight,
